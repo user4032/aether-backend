@@ -1,6 +1,6 @@
 const PORT = process.env.PORT || 3000;
 const io = require('socket.io')(PORT, { cors: { origin: "*" } });
-const sqlite3 = require('sqlite3').verbose();
+const { createClient } = require('@libsql/client');
 const bcrypt = require('bcrypt');
 const admin = require('firebase-admin');
 const nodemailer = require('nodemailer');
@@ -18,72 +18,84 @@ try {
 // ─── Email transporter ──────────────────────────────────────────────────────
 const EMAIL_USER = process.env.EMAIL_USER || '';
 const EMAIL_PASS = process.env.EMAIL_PASS || '';
-const ADMIN_USERNAME = 'den'; 
+const ADMIN_USERNAME = 'den';
 
 const transporter = EMAIL_USER && EMAIL_PASS
-  ? nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-    })
+  ? nodemailer.createTransport({ service: 'gmail', auth: { user: EMAIL_USER, pass: EMAIL_PASS } })
   : null;
 
-if (!transporter) {
-  console.warn('⚠️  EMAIL_USER/EMAIL_PASS not set, email verification disabled');
-}
+if (!transporter) console.warn('⚠️  EMAIL_USER/EMAIL_PASS not set');
 
-// ─── DB ─────────────────────────────────────────────────────────────────────
-const db = new sqlite3.Database('./chat.db', (err) => {
-  if (err) console.error('Помилка БД:', err.message);
-  else console.log('🗄️  База Aether готова');
-});
+// ─── ХМАРНА БАЗА ДАНИХ TURSO ────────────────────────────────────────────────
+const dbUrl = process.env.TURSO_URL || 'file:chat.db';
+const dbToken = process.env.TURSO_AUTH_TOKEN || '';
+
+const client = createClient({ url: dbUrl, authToken: dbToken });
+
+// Спеціальна обгортка, щоб старий код працював з новою хмарною базою!
+const db = {
+  run: async (sql, params, cb) => {
+    if (typeof params === 'function') { cb = params; params = []; }
+    try {
+      const res = await client.execute({ sql, args: (params||[]).map(p => p === undefined ? null : p) });
+      if (cb) cb.call({ changes: res.rowsAffected, lastID: Number(res.lastInsertRowid) }, null);
+    } catch (e) { if (cb) cb(e); else console.error('DB Run Error:', e.message); }
+  },
+  get: async (sql, params, cb) => {
+    if (typeof params === 'function') { cb = params; params = []; }
+    try {
+      const res = await client.execute({ sql, args: (params||[]).map(p => p === undefined ? null : p) });
+      if (cb) cb(null, res.rows[0]);
+    } catch (e) { if (cb) cb(e); else console.error('DB Get Error:', e.message); }
+  },
+  all: async (sql, params, cb) => {
+    if (typeof params === 'function') { cb = params; params = []; }
+    try {
+      const res = await client.execute({ sql, args: (params||[]).map(p => p === undefined ? null : p) });
+      if (cb) cb(null, res.rows);
+    } catch (e) { if (cb) cb(e); else console.error('DB All Error:', e.message); }
+  },
+  prepare: (sql) => {
+    return {
+      run: async (...args) => {
+        let cb = args.length > 0 && typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        try {
+          const res = await client.execute({ sql, args: args.map(p => p === undefined ? null : p) });
+          if (cb) cb.call({ changes: res.rowsAffected, lastID: Number(res.lastInsertRowid) }, null);
+        } catch (e) { if (cb) cb(e); else console.error('Prepare error:', e.message); }
+      },
+      finalize: () => {}
+    };
+  }
+};
 
 const activeUsers = new Map();
 const pendingVerifications = new Map();
 
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    userName TEXT PRIMARY KEY,
-    password TEXT,
-    publicKey TEXT,
-    fcmToken TEXT,
-    avatar TEXT,
-    bio TEXT,
-    email TEXT,
-    isVerified INTEGER DEFAULT 0
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT DEFAULT 'text',
-    senderName TEXT, receiverName TEXT,
-    text TEXT, ciphertext TEXT, nonce TEXT, mac TEXT, publicKey TEXT,
-    status TEXT DEFAULT 'sent', timestamp TEXT, isEdited INTEGER DEFAULT 0
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, name TEXT, isGroup BOOLEAN)`);
-  db.run(`CREATE TABLE IF NOT EXISTS chat_participants (chatId TEXT, userName TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS friends (requester TEXT, receiver TEXT, status TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS chat_settings (
-    userName TEXT, partnerName TEXT,
-    isPinned INTEGER DEFAULT 0, isHidden INTEGER DEFAULT 0, isBlocked INTEGER DEFAULT 0,
-    PRIMARY KEY(userName, partnerName)
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS reactions (
-    msgTimestamp TEXT, msgSender TEXT, reactorName TEXT, emoji TEXT,
-    PRIMARY KEY(msgTimestamp, msgSender, reactorName)
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS scheduled_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT DEFAULT 'text', senderName TEXT, receiverName TEXT,
-    text TEXT, ciphertext TEXT, nonce TEXT, mac TEXT, publicKey TEXT, scheduledAt TEXT
-  )`);
+// Безпечна ініціалізація таблиць у хмарі
+async function initDB() {
+  const tables = [
+    `CREATE TABLE IF NOT EXISTS users (userName TEXT PRIMARY KEY, password TEXT, publicKey TEXT, fcmToken TEXT, avatar TEXT, bio TEXT, email TEXT, isVerified INTEGER DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT DEFAULT 'text', senderName TEXT, receiverName TEXT, text TEXT, ciphertext TEXT, nonce TEXT, mac TEXT, publicKey TEXT, status TEXT DEFAULT 'sent', timestamp TEXT, isEdited INTEGER DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, name TEXT, isGroup BOOLEAN)`,
+    `CREATE TABLE IF NOT EXISTS chat_participants (chatId TEXT, userName TEXT)`,
+    `CREATE TABLE IF NOT EXISTS friends (requester TEXT, receiver TEXT, status TEXT)`,
+    `CREATE TABLE IF NOT EXISTS chat_settings (userName TEXT, partnerName TEXT, isPinned INTEGER DEFAULT 0, isHidden INTEGER DEFAULT 0, isBlocked INTEGER DEFAULT 0, PRIMARY KEY(userName, partnerName))`,
+    `CREATE TABLE IF NOT EXISTS reactions (msgTimestamp TEXT, msgSender TEXT, reactorName TEXT, emoji TEXT, PRIMARY KEY(msgTimestamp, msgSender, reactorName))`,
+    `CREATE TABLE IF NOT EXISTS scheduled_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT DEFAULT 'text', senderName TEXT, receiverName TEXT, text TEXT, ciphertext TEXT, nonce TEXT, mac TEXT, publicKey TEXT, scheduledAt TEXT)`
+  ];
+  for (const t of tables) { await client.execute(t); }
 
-  ['fcmToken', 'avatar', 'bio', 'email'].forEach(col =>
-    db.run(`ALTER TABLE users ADD COLUMN ${col} TEXT`, () => {}));
-  db.run(`ALTER TABLE users ADD COLUMN isVerified INTEGER DEFAULT 0`, () => {});
-  db.run(`ALTER TABLE messages ADD COLUMN isEdited INTEGER DEFAULT 0`, () => {});
-  db.run(`ALTER TABLE chat_settings ADD COLUMN isBlocked INTEGER DEFAULT 0`, () => {});
+  const cols = ['fcmToken', 'avatar', 'bio', 'email'];
+  for (const col of cols) { try { await client.execute(`ALTER TABLE users ADD COLUMN ${col} TEXT`); } catch(e){} }
+  try { await client.execute(`ALTER TABLE users ADD COLUMN isVerified INTEGER DEFAULT 0`); } catch(e){}
+  try { await client.execute(`ALTER TABLE messages ADD COLUMN isEdited INTEGER DEFAULT 0`); } catch(e){}
+  try { await client.execute(`ALTER TABLE chat_settings ADD COLUMN isBlocked INTEGER DEFAULT 0`); } catch(e){}
 
-  db.run(`UPDATE users SET isVerified = 1 WHERE userName = ?`, [ADMIN_USERNAME]);
-});
+  await client.execute({ sql: `UPDATE users SET isVerified = 1 WHERE userName = ?`, args: [ADMIN_USERNAME] });
+  console.log('🗄️  База Aether успішно підключена до хмари Turso!');
+}
+initDB();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function parseReactions(raw) {
