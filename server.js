@@ -169,18 +169,21 @@ io.on('connection', (socket) => {
   socket.on('send_verification_email', async (data, callback) => {
     const { userName, email, password, publicKey } = data;
     if (!userName || !email || !password) return callback({ success: false, message: 'Заповни всі поля' });
+
     db.get(`SELECT userName FROM users WHERE userName = ? OR email = ?`, [userName, email], async (err, row) => {
       if (row) return callback({ success: false, message: 'Нікнейм або email вже зайнятий' });
+
       const code = generateCode();
       const expiresAt = Date.now() + 10 * 60 * 1000;
       pendingVerifications.set(email, { code, userData: { userName, email, password, publicKey }, expiresAt });
-      try {
-        await sendVerificationEmail(email, code, userName);
-        callback({ success: true });
-      } catch (e) {
-        console.error('Email error:', e);
-        callback({ success: false, message: 'Помилка надсилання листа' });
-      }
+
+      // ХАК ДЛЯ RENDER: Замість відправки листа, виводимо код у логи!
+      console.log(`\n======================================`);
+      console.log(`🔐 КОД ПІДТВЕРДЖЕННЯ ДЛЯ ${email}: ${code}`);
+      console.log(`======================================\n`);
+
+      // Кажемо телефону, що лист "успішно" відправлено
+      callback({ success: true }); 
     });
   });
 
