@@ -78,7 +78,7 @@ async function initDB() {
   const tables = [
     `CREATE TABLE IF NOT EXISTS users (userName TEXT PRIMARY KEY, password TEXT, publicKey TEXT, fcmToken TEXT, avatar TEXT, bio TEXT, displayName TEXT, email TEXT, isVerified INTEGER DEFAULT 0, readReceipts INTEGER DEFAULT 1, onlineStatus INTEGER DEFAULT 1, typingIndicator INTEGER DEFAULT 1, notificationsEnabled INTEGER DEFAULT 1, messagePreview INTEGER DEFAULT 1, dmPermission TEXT DEFAULT 'everyone')`,
     `CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT DEFAULT 'text', senderName TEXT, receiverName TEXT, text TEXT, ciphertext TEXT, nonce TEXT, mac TEXT, publicKey TEXT, status TEXT DEFAULT 'sent', timestamp TEXT, isEdited INTEGER DEFAULT 0)`,
-    `CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, name TEXT, isGroup BOOLEAN)`,
+    `CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, name TEXT, description TEXT DEFAULT '', isGroup BOOLEAN)`,
     `CREATE TABLE IF NOT EXISTS chat_participants (chatId TEXT, userName TEXT)`,
     `CREATE TABLE IF NOT EXISTS friends (requester TEXT, receiver TEXT, status TEXT)`,
     `CREATE TABLE IF NOT EXISTS chat_settings (userName TEXT, partnerName TEXT, isPinned INTEGER DEFAULT 0, isHidden INTEGER DEFAULT 0, isBlocked INTEGER DEFAULT 0, PRIMARY KEY(userName, partnerName))`,
@@ -101,6 +101,7 @@ async function initDB() {
   try { await client.execute(`ALTER TABLE messages ADD COLUMN isEdited INTEGER DEFAULT 0`); } catch(e){}
   try { await client.execute(`ALTER TABLE chat_settings ADD COLUMN isBlocked INTEGER DEFAULT 0`); } catch(e){}
   try { await client.execute(`ALTER TABLE user_devices ADD COLUMN isCurrent INTEGER DEFAULT 0`); } catch(e){}
+  try { await client.execute(`ALTER TABLE chats ADD COLUMN description TEXT DEFAULT ''`); } catch(e){}
 
   const indexes = [
     `CREATE INDEX IF NOT EXISTS idx_messages_receiver_id ON messages(receiverName, id DESC)`,
@@ -692,7 +693,8 @@ io.on('connection', (socket) => {
 
   socket.on('create_group', (data, callback) => {
     const groupId = 'GROUP_' + Date.now();
-    db.run(`INSERT INTO chats (id,name,isGroup) VALUES (?,?,1)`, [groupId, data.name], (err) => {
+    const groupDescription = (data.description || '').toString().trim().slice(0, 180);
+    db.run(`INSERT INTO chats (id,name,description,isGroup) VALUES (?,?,?,1)`, [groupId, data.name, groupDescription], (err) => {
       if (err) return callback({ success: false });
       const stmt = db.prepare(`INSERT INTO chat_participants (chatId,userName) VALUES (?,?)`);
       data.participants.forEach(p => stmt.run(groupId, p));
@@ -701,6 +703,135 @@ io.on('connection', (socket) => {
       [...data.participants, data.creator].forEach(m => io.emit('refresh_chats', { userName: m }));
       callback({ success: true, groupId });
     });
+  });
+
+  socket.on('get_group_info', async (data, callback) => {
+    const safeCallback = typeof callback === 'function' ? callback : () => {};
+    try {
+      const groupId = (data?.groupId || '').toString();
+      const userName = (data?.userName || '').toString();
+      if (!groupId.startsWith('GROUP_') || !userName) {
+        safeCallback({ success: false, message: 'Invalid request' });
+        return;
+      }
+
+      const memberCheck = await client.execute({
+        sql: `SELECT 1 FROM chat_participants WHERE chatId = ? AND userName = ? LIMIT 1`,
+        args: [groupId, userName],
+      });
+      if (!memberCheck.rows.length) {
+        safeCallback({ success: false, message: 'Access denied' });
+        return;
+      }
+
+      const groupRows = await client.execute({
+        sql: `SELECT id, name, description FROM chats WHERE id = ? AND isGroup = 1 LIMIT 1`,
+        args: [groupId],
+      });
+      if (!groupRows.rows.length) {
+        safeCallback({ success: false, message: 'Group not found' });
+        return;
+      }
+
+      const membersRows = await client.execute({
+        sql: `
+          SELECT cp.userName, u.displayName, u.avatar, u.isVerified
+          FROM chat_participants cp
+          LEFT JOIN users u ON u.userName = cp.userName
+          WHERE cp.chatId = ?
+          ORDER BY cp.userName ASC
+        `,
+        args: [groupId],
+      });
+
+      const group = groupRows.rows[0];
+      safeCallback({
+        success: true,
+        groupId,
+        name: (group.name || '').toString(),
+        description: (group.description || '').toString(),
+        members: membersRows.rows.map((m) => ({
+          userName: (m.userName || '').toString(),
+          displayName: (m.displayName || '').toString(),
+          avatar: m.avatar || null,
+          isVerified: Number(m.isVerified || 0) === 1,
+        })),
+      });
+    } catch (e) {
+      console.error('get_group_info error:', e?.message || e);
+      safeCallback({ success: false, message: 'Failed to load group info' });
+    }
+  });
+
+  socket.on('update_group', async (data, callback) => {
+    const safeCallback = typeof callback === 'function' ? callback : () => {};
+    try {
+      const groupId = (data?.groupId || '').toString();
+      const editor = (data?.editor || '').toString();
+      const nextName = (data?.name || '').toString().trim().slice(0, 64);
+      const nextDescription = (data?.description || '').toString().trim().slice(0, 180);
+      const requestedMembers = Array.isArray(data?.participants)
+        ? data.participants.map((v) => (v || '').toString().trim()).filter(Boolean)
+        : [];
+
+      if (!groupId.startsWith('GROUP_') || !editor || !nextName) {
+        safeCallback({ success: false, message: 'Invalid request' });
+        return;
+      }
+
+      const editCheck = await client.execute({
+        sql: `SELECT 1 FROM chat_participants WHERE chatId = ? AND userName = ? LIMIT 1`,
+        args: [groupId, editor],
+      });
+      if (!editCheck.rows.length) {
+        safeCallback({ success: false, message: 'Access denied' });
+        return;
+      }
+
+      const dedupMembers = new Set(requestedMembers);
+      dedupMembers.add(editor);
+      const nextMembers = Array.from(dedupMembers).slice(0, 500);
+
+      const validUsers = await client.execute({
+        sql: `SELECT userName FROM users WHERE userName IN (${nextMembers.map(() => '?').join(',')})`,
+        args: nextMembers,
+      });
+      const validMemberSet = new Set(validUsers.rows.map((r) => (r.userName || '').toString()));
+      const finalMembers = nextMembers.filter((u) => validMemberSet.has(u));
+      if (!finalMembers.includes(editor)) finalMembers.push(editor);
+
+      const previousMembersRows = await client.execute({
+        sql: `SELECT userName FROM chat_participants WHERE chatId = ?`,
+        args: [groupId],
+      });
+      const previousMembers = previousMembersRows.rows.map((r) => (r.userName || '').toString());
+
+      await client.execute({
+        sql: `UPDATE chats SET name = ?, description = ? WHERE id = ? AND isGroup = 1`,
+        args: [nextName, nextDescription, groupId],
+      });
+
+      await client.execute({
+        sql: `DELETE FROM chat_participants WHERE chatId = ?`,
+        args: [groupId],
+      });
+      for (const user of finalMembers) {
+        await client.execute({
+          sql: `INSERT INTO chat_participants (chatId, userName) VALUES (?, ?)`,
+          args: [groupId, user],
+        });
+      }
+
+      const notifyUsers = new Set([...previousMembers, ...finalMembers]);
+      notifyUsers.forEach((u) => {
+        if (u) io.emit('refresh_chats', { userName: u });
+      });
+
+      safeCallback({ success: true, name: nextName, description: nextDescription, participants: finalMembers });
+    } catch (e) {
+      console.error('update_group error:', e?.message || e);
+      safeCallback({ success: false, message: 'Failed to update group' });
+    }
   });
 
   socket.on('update_chat_settings', (data) => {
