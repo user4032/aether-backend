@@ -16,15 +16,41 @@ try {
 }
 
 // ─── Email transporter ────────────────────────────────────────────────────
-const EMAIL_USER = process.env.EMAIL_USER || '';
-const EMAIL_PASS = process.env.EMAIL_PASS || '';
+const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || '';
+const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || 587);
+const EMAIL_SMTP_SECURE = (process.env.EMAIL_SMTP_SECURE || 'false').toLowerCase() === 'true';
+const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || process.env.EMAIL_USER || '';
+const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || process.env.EMAIL_PASS || '';
+const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Lumyn';
+const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || EMAIL_SMTP_USER;
+const EMAIL_ALLOW_LOG_FALLBACK = (process.env.EMAIL_ALLOW_LOG_FALLBACK || 'false').toLowerCase() === 'true';
 const ADMIN_USERNAME = 'den';
 
-const transporter = EMAIL_USER && EMAIL_PASS
-  ? nodemailer.createTransport({ service: 'gmail', auth: { user: EMAIL_USER, pass: EMAIL_PASS } })
-  : null;
+let transporter = null;
 
-if (!transporter) console.warn('⚠️  EMAIL_USER/EMAIL_PASS not set');
+if (EMAIL_SMTP_HOST && EMAIL_SMTP_USER && EMAIL_SMTP_PASS) {
+  transporter = nodemailer.createTransport({
+    host: EMAIL_SMTP_HOST,
+    port: EMAIL_SMTP_PORT,
+    secure: EMAIL_SMTP_SECURE,
+    auth: {
+      user: EMAIL_SMTP_USER,
+      pass: EMAIL_SMTP_PASS,
+    },
+  });
+} else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+  transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+  });
+}
+
+if (!transporter) {
+  console.warn('⚠️  Email is not configured. Set SMTP env vars to enable verification emails.');
+}
 
 // ─── ХМАРНА БАЗА ДАНИХ TURSO ────────────────────────────────────────────────
 const dbUrl = process.env.TURSO_URL || 'file:chat.db';
@@ -152,10 +178,10 @@ function getDefaultDeviceName(deviceId) {
 async function sendVerificationEmail(email, code, userName) {
   if (!transporter) throw new Error('Email transporter not configured');
   const mailOptions = {
-    from: `"Aether" <${EMAIL_USER}>`,
+    from: `"${EMAIL_FROM_NAME}" <${EMAIL_FROM_ADDRESS}>`,
     to: email,
-    subject: 'Ваш код підтвердження Aether',
-    html: `<div style="font-family:sans-serif;background:#000;color:#fff;padding:40px;border-radius:16px;max-width:400px"><h1 style="font-size:24px;margin:0 0 8px">Aether</h1><p style="color:#888;margin:0 0 32px;font-size:13px">Core Protocol</p><p style="color:#ccc;margin:0 0 16px">Привіт, <strong>${userName}</strong>!</p><p style="color:#ccc;margin:0 0 24px">Твій код підтвердження:</p><div style="background:#1a0b2e;border:1px solid #b026ff55;border-radius:12px;padding:20px;text-align:center;font-size:36px;letter-spacing:12px;font-weight:bold;color:#e5b3ff">${code}</div><p style="color:#555;margin:24px 0 0;font-size:12px">Код дійсний 10 хвилин. Якщо ти не реєструвався — проігноруй цей лист.</p></div>`,
+    subject: 'Lumyn verification code',
+    html: `<div style="font-family:sans-serif;background:#000;color:#fff;padding:40px;border-radius:16px;max-width:400px"><h1 style="font-size:24px;margin:0 0 8px">Lumyn</h1><p style="color:#888;margin:0 0 32px;font-size:13px">Secure Messaging</p><p style="color:#ccc;margin:0 0 16px">Hi, <strong>${userName}</strong>.</p><p style="color:#ccc;margin:0 0 24px">Your verification code:</p><div style="background:#1a0b2e;border:1px solid #b026ff55;border-radius:12px;padding:20px;text-align:center;font-size:36px;letter-spacing:12px;font-weight:bold;color:#e5b3ff">${code}</div><p style="color:#555;margin:24px 0 0;font-size:12px">This code expires in 10 minutes. If this was not you, ignore this email.</p></div>`,
   };
   await transporter.sendMail(mailOptions);
 }
@@ -317,11 +343,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_verification_email', async (data, callback) => {
-    const { userName, email, password, publicKey } = data;
-    if (!userName || !email || !password) return callback({ success: false, message: 'Заповни всі поля' });
+    const safeCallback = typeof callback === 'function' ? callback : () => {};
+    const { userName, password, publicKey } = data || {};
+    const email = (data?.email || '').toString().trim().toLowerCase();
+    if (!userName || !email || !password) return safeCallback({ success: false, message: 'Заповни всі поля' });
 
     db.get(`SELECT userName FROM users WHERE userName = ? OR email = ?`, [userName, email], async (err, row) => {
-      if (row) return callback({ success: false, message: 'Нікнейм або email вже зайнятий' });
+      if (row) return safeCallback({ success: false, message: 'Нікнейм або email вже зайнятий' });
 
       const code = generateCode();
       const expiresAt = Date.now() + 10 * 60 * 1000;
@@ -338,18 +366,28 @@ io.on('connection', (socket) => {
         expiresAt,
       });
 
-      // ХАК ДЛЯ RENDER: Замість відправки листа, виводимо код у логи!
-      console.log(`\n======================================`);
-      console.log(`🔐 КОД ПІДТВЕРДЖЕННЯ ДЛЯ ${email}: ${code}`);
-      console.log(`======================================\n`);
-
-      // Кажемо телефону, що лист "успішно" відправлено
-      callback({ success: true }); 
+      try {
+        await sendVerificationEmail(email, code, userName);
+        safeCallback({ success: true });
+      } catch (emailErr) {
+        console.error('send_verification_email error:', emailErr?.message || emailErr);
+        if (EMAIL_ALLOW_LOG_FALLBACK) {
+          console.warn('⚠️ EMAIL_ALLOW_LOG_FALLBACK enabled. Verification code is printed to logs.');
+          console.log(`\n======================================`);
+          console.log(`🔐 VERIFICATION CODE FOR ${email}: ${code}`);
+          console.log(`======================================\n`);
+          safeCallback({ success: true, message: 'Email service unavailable. Dev log fallback used.' });
+          return;
+        }
+        pendingVerifications.delete(email);
+        safeCallback({ success: false, message: 'Не вдалося надіслати лист. Спробуйте ще раз.' });
+      }
     });
   });
 
   socket.on('verify_email_code', async (data, callback) => {
-    const { email, code } = data;
+    const email = (data?.email || '').toString().trim().toLowerCase();
+    const code = (data?.code || '').toString().trim();
     const pending = pendingVerifications.get(email);
     if (!pending) return callback({ success: false, message: 'Код не знайдено або прострочено' });
     if (pending.expiresAt < Date.now()) {
