@@ -1,10 +1,25 @@
+const http = require('http');
 const PORT = process.env.PORT || 3000;
-const io = require('socket.io')(PORT, { cors: { origin: "*" } });
 const { createClient } = require('@libsql/client');
 const bcrypt = require('bcryptjs');
 const admin = require('firebase-admin');
 const nodemailer = require('nodemailer');
-
+const server = http.createServer((req, res) => {
+  // Додаємо простий healthcheck для Render
+  if (req.method === 'GET' && req.url === '/') {
+    res.writeHead(200);
+    res.end('Aether Backend is running');
+    return;
+  }
+  res.writeHead(404);
+  res.end('Not Found');
+});
+const io = require('socket.io')(server, { 
+  cors: { 
+    origin: "*",
+    methods: ["GET", "POST"]
+  } 
+});
 // ─── Firebase ───────────────────────────────────────────────────────────────
 let firebaseEnabled = false;
 try {
@@ -220,9 +235,25 @@ setInterval(() => {
   }
 }, 30000);
 
-console.log(`🚀 Сервер Aether запущено на порту ${PORT}`);
-
+server.listen(PORT, () => {
+  console.log(`🚀 Сервер Aether запущено на порту ${PORT}`);
+});
 // ─── Socket.io ───────────────────────────────────────────────────────────────
+// (Шматок з твого server.js, де ти проксіюєш /socket.io/)
+    proxy.on('error', (e) => {
+      console.error('Proxy error:', e.message);
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end('Proxy error: ' + e.message);
+      }
+    });
+
+    // ЦЕ КРИТИЧНО ДЛЯ POLLING (який використовує GET)
+    if (req.method === 'GET' || req.method === 'OPTIONS') {
+      proxy.end();
+    } else {
+      req.pipe(proxy); 
+    }
 io.on('connection', (socket) => {
 
   const emitToUserSockets = (userName, event, payload, excludeSocketId = null) => {
