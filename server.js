@@ -4,6 +4,12 @@ const { createClient } = require('@libsql/client');
 const bcrypt = require('bcryptjs');
 const admin = require('firebase-admin');
 const nodemailer = require('nodemailer');
+let Resend = null;
+try {
+  ({ Resend } = require('resend'));
+} catch (_) {
+  Resend = null;
+}
 const server = http.createServer((req, res) => {
   // Додаємо простий healthcheck для Render
   if (req.method === 'GET' && req.url === '/') {
@@ -38,10 +44,17 @@ const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || process.env.EMAIL_USER ||
 const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || process.env.EMAIL_PASS || '';
 const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Lumyn';
 const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || EMAIL_SMTP_USER;
+const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_NpqZjjXw_14zq56F1a625piXgJZkesMAQ';
+const RESEND_FROM_ADDRESS = process.env.RESEND_FROM_ADDRESS || EMAIL_FROM_ADDRESS || 'verify@lumyn.space';
 const EMAIL_ALLOW_LOG_FALLBACK = (process.env.EMAIL_ALLOW_LOG_FALLBACK || 'false').toLowerCase() === 'true';
 const ADMIN_USERNAME = 'den';
 
 let transporter = null;
+let resendClient = null;
+
+if (RESEND_API_KEY && Resend) {
+  resendClient = new Resend(RESEND_API_KEY);
+}
 
 if (EMAIL_SMTP_HOST && EMAIL_SMTP_USER && EMAIL_SMTP_PASS) {
   transporter = nodemailer.createTransport({
@@ -190,15 +203,92 @@ function getDefaultDeviceName(deviceId) {
   return `Device ${deviceId.toString().slice(0, 6)}`;
 }
 
+function buildVerificationEmailHtml(code) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Verification Code</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #020617; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #020617; padding: 40px 20px;">
+    <tr>
+      <td align="center">
+        <table width="100%" max-width="500" border="0" cellspacing="0" cellpadding="0" style="max-width: 500px; background-color: #0f172a; border-radius: 16px; padding: 40px; border: 1px solid rgba(255,255,255,0.08);">
+          <tr>
+            <td align="center" style="padding-bottom: 25px;">
+              <img src="https://lumyn.space/logo.png" width="120" alt="Lumyn Logo" style="display: block;">
+            </td>
+          </tr>
+          <tr>
+            <td align="center">
+              <h2 style="color: #ffffff; margin: 0 0 15px 0; font-size: 24px; font-weight: 600;">
+                Verify your Lumyn account
+              </h2>
+              <p style="color: #9ca3af; margin: 0; font-size: 15px; line-height: 1.6;">
+                Welcome to Lumyn. Use the verification code below to complete your login.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding: 35px 0;">
+              <div style="background: #020617; padding: 22px; border-radius: 12px; font-size: 34px; letter-spacing: 8px; font-weight: 700; color: #ffffff; border: 1px solid rgba(255,255,255,0.05);">
+                ${code}
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td align="center">
+              <p style="color: #9ca3af; margin: 0; font-size: 14px;">
+                This code expires in <b style="color: #ffffff;">10 minutes</b>.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding: 35px 0;">
+              <hr style="border: none; border-top: 1px solid #1f2937; margin: 0;">
+            </td>
+          </tr>
+          <tr>
+            <td align="center">
+              <p style="color: #6b7280; margin: 0 0 20px 0; font-size: 12px; line-height: 1.5;">
+                If you did not request this email, you can safely ignore it.
+              </p>
+              <p style="color: #4b5563; margin: 0; font-size: 12px;">
+                © 2026 Lumyn
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
 async function sendVerificationEmail(email, code, userName) {
+  const html = buildVerificationEmailHtml(code);
+  const recipient = Array.isArray(email) ? email : [email];
+
+  if (resendClient) {
+    await resendClient.emails.send({
+      from: `${EMAIL_FROM_NAME} <${RESEND_FROM_ADDRESS}>`,
+      to: recipient,
+      subject: 'Verify your Lumyn account',
+      html,
+    });
+    return;
+  }
+
   if (!transporter) throw new Error('Email transporter not configured');
-  const mailOptions = {
+  await transporter.sendMail({
     from: `"${EMAIL_FROM_NAME}" <${EMAIL_FROM_ADDRESS}>`,
-    to: email,
-    subject: 'Lumyn verification code',
-    html: `<div style="font-family:sans-serif;background:#000;color:#fff;padding:40px;border-radius:16px;max-width:400px"><h1 style="font-size:24px;margin:0 0 8px">Lumyn</h1><p style="color:#888;margin:0 0 32px;font-size:13px">Secure Messaging</p><p style="color:#ccc;margin:0 0 16px">Hi, <strong>${userName}</strong>.</p><p style="color:#ccc;margin:0 0 24px">Your verification code:</p><div style="background:#1a0b2e;border:1px solid #b026ff55;border-radius:12px;padding:20px;text-align:center;font-size:36px;letter-spacing:12px;font-weight:bold;color:#e5b3ff">${code}</div><p style="color:#555;margin:24px 0 0;font-size:12px">This code expires in 10 minutes. If this was not you, ignore this email.</p></div>`,
-  };
-  await transporter.sendMail(mailOptions);
+    to: recipient,
+    subject: 'Verify your Lumyn account',
+    html,
+  });
 }
 
 // ─── Scheduled messages ──────────────────────────────────────────────────────
@@ -239,21 +329,7 @@ server.listen(PORT, () => {
   console.log(`🚀 Сервер Aether запущено на порту ${PORT}`);
 });
 // ─── Socket.io ───────────────────────────────────────────────────────────────
-// (Шматок з твого server.js, де ти проксіюєш /socket.io/)
-    proxy.on('error', (e) => {
-      console.error('Proxy error:', e.message);
-      if (!res.headersSent) {
-        res.writeHead(502);
-        res.end('Proxy error: ' + e.message);
-      }
-    });
 
-    // ЦЕ КРИТИЧНО ДЛЯ POLLING (який використовує GET)
-    if (req.method === 'GET' || req.method === 'OPTIONS') {
-      proxy.end();
-    } else {
-      req.pipe(proxy); 
-    }
 io.on('connection', (socket) => {
 
   const emitToUserSockets = (userName, event, payload, excludeSocketId = null) => {
@@ -502,7 +578,8 @@ io.on('connection', (socket) => {
         db.get(`SELECT COUNT(*) as cnt FROM user_devices WHERE userName = ? AND isTrusted = 1 AND isRevoked = 0`, [userName], (cErr, countRow) => {
           const trustedCount = Number(countRow?.cnt || 0);
           const hasKnownTrustedDevice = trustedCount > 0;
-          const canAutoApprove = !hasKnownTrustedDevice || (existingDevice && existingDevice.isRevoked !== 1);
+          const isAccountVerified = userRow.isVerified === 1;
+          const canAutoApprove = isAccountVerified || !hasKnownTrustedDevice || (existingDevice && existingDevice.isRevoked !== 1);
 
           if (canAutoApprove) {
             const canonicalPublicKey = userRow.publicKey || data.publicKey;

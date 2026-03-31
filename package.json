@@ -11,6 +11,7 @@
     "bcryptjs": "^3.0.3",
     "firebase-admin": "^12.0.0",
     "nodemailer": "^6.9.13",
+    "resend": "^4.7.0",
     "socket.io": "^4.7.5"
   }
 }
