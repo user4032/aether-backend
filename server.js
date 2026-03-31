@@ -44,9 +44,10 @@ const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || process.env.EMAIL_USER ||
 const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || process.env.EMAIL_PASS || '';
 const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Lumyn';
 const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || EMAIL_SMTP_USER;
-const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_NpqZjjXw_14zq56F1a625piXgJZkesMAQ';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const RESEND_FROM_ADDRESS = process.env.RESEND_FROM_ADDRESS || EMAIL_FROM_ADDRESS || 'verify@lumyn.space';
 const EMAIL_ALLOW_LOG_FALLBACK = (process.env.EMAIL_ALLOW_LOG_FALLBACK || 'false').toLowerCase() === 'true';
+const VERIFICATION_DEBUG = (process.env.VERIFICATION_DEBUG || 'false').toLowerCase() === 'true';
 const ADMIN_USERNAME = 'den';
 
 let transporter = null;
@@ -271,24 +272,36 @@ function buildVerificationEmailHtml(code) {
 async function sendVerificationEmail(email, code, userName) {
   const html = buildVerificationEmailHtml(code);
   const recipient = Array.isArray(email) ? email : [email];
+  const provider = resendClient ? 'resend' : 'smtp';
+
+  if (VERIFICATION_DEBUG) {
+    console.log(`[verify][send:start] provider=${provider} email=${recipient[0]} user=${userName} codeLen=${String(code || '').length}`);
+  }
 
   if (resendClient) {
-    await resendClient.emails.send({
+    const resendResult = await resendClient.emails.send({
       from: `${EMAIL_FROM_NAME} <${RESEND_FROM_ADDRESS}>`,
       to: recipient,
       subject: 'Verify your Lumyn account',
       html,
     });
+    if (VERIFICATION_DEBUG) {
+      const resendId = resendResult?.data?.id || resendResult?.id || 'n/a';
+      console.log(`[verify][send:ok] provider=resend email=${recipient[0]} id=${resendId}`);
+    }
     return;
   }
 
   if (!transporter) throw new Error('Email transporter not configured');
-  await transporter.sendMail({
+  const smtpResult = await transporter.sendMail({
     from: `"${EMAIL_FROM_NAME}" <${EMAIL_FROM_ADDRESS}>`,
     to: recipient,
     subject: 'Verify your Lumyn account',
     html,
   });
+  if (VERIFICATION_DEBUG) {
+    console.log(`[verify][send:ok] provider=smtp email=${recipient[0]} messageId=${smtpResult?.messageId || 'n/a'}`);
+  }
 }
 
 // ─── Scheduled messages ──────────────────────────────────────────────────────
@@ -453,6 +466,9 @@ io.on('connection', (socket) => {
     const safeCallback = typeof callback === 'function' ? callback : () => {};
     const { userName, password, publicKey } = data || {};
     const email = (data?.email || '').toString().trim().toLowerCase();
+    if (VERIFICATION_DEBUG) {
+      console.log(`[verify][request] user=${userName || 'n/a'} email=${email || 'n/a'} hasPassword=${Boolean(password)} hasPublicKey=${Boolean(publicKey)}`);
+    }
     if (!userName || !email || !password) return safeCallback({ success: false, message: 'Заповни всі поля' });
 
     db.get(`SELECT userName FROM users WHERE userName = ? OR email = ?`, [userName, email], async (err, row) => {
@@ -460,6 +476,9 @@ io.on('connection', (socket) => {
 
       const code = generateCode();
       const expiresAt = Date.now() + 10 * 60 * 1000;
+      if (VERIFICATION_DEBUG) {
+        console.log(`[verify][code:generated] email=${email} expiresAt=${new Date(expiresAt).toISOString()}`);
+      }
       pendingVerifications.set(email, {
         code,
         userData: {
@@ -475,6 +494,9 @@ io.on('connection', (socket) => {
 
       try {
         await sendVerificationEmail(email, code, userName);
+        if (VERIFICATION_DEBUG) {
+          console.log(`[verify][request:success] email=${email}`);
+        }
         safeCallback({ success: true });
       } catch (emailErr) {
         console.error('send_verification_email error:', emailErr?.message || emailErr);
