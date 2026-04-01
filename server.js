@@ -55,6 +55,8 @@ let resendClient = null;
 
 if (RESEND_API_KEY && Resend) {
   resendClient = new Resend(RESEND_API_KEY);
+} else if (RESEND_API_KEY && !Resend) {
+  console.warn('⚠️  RESEND_API_KEY is set but the resend package is unavailable.');
 }
 
 if (EMAIL_SMTP_HOST && EMAIL_SMTP_USER && EMAIL_SMTP_PASS) {
@@ -79,6 +81,10 @@ if (EMAIL_SMTP_HOST && EMAIL_SMTP_USER && EMAIL_SMTP_PASS) {
 
 if (!transporter) {
   console.warn('⚠️  Email is not configured. Set SMTP env vars to enable verification emails.');
+}
+
+if (resendClient && (!RESEND_FROM_ADDRESS || !RESEND_FROM_ADDRESS.includes('@'))) {
+  console.warn('⚠️  RESEND_FROM_ADDRESS is missing or invalid. Email delivery may fail.');
 }
 
 // ─── ХМАРНА БАЗА ДАНИХ TURSO ────────────────────────────────────────────────
@@ -279,12 +285,28 @@ async function sendVerificationEmail(email, code, userName) {
   }
 
   if (resendClient) {
-    const resendResult = await resendClient.emails.send({
-      from: `${EMAIL_FROM_NAME} <${RESEND_FROM_ADDRESS}>`,
-      to: recipient,
-      subject: 'Verify your Lumyn account',
-      html,
-    });
+    let resendResult;
+    try {
+      resendResult = await resendClient.emails.send({
+        from: `${EMAIL_FROM_NAME} <${RESEND_FROM_ADDRESS}>`,
+        to: recipient,
+        subject: 'Verify your Lumyn account',
+        html,
+      });
+    } catch (err) {
+      const status = err?.statusCode || err?.status || 'n/a';
+      const details = err?.response?.data || err?.body || err?.message || 'unknown error';
+      const detailsText = typeof details === 'string' ? details : JSON.stringify(details);
+      throw new Error(`Resend send failed (status=${status}): ${detailsText}`);
+    }
+    if (resendResult?.error) {
+      const details = resendResult.error;
+      const detailsText = typeof details === 'string' ? details : JSON.stringify(details);
+      throw new Error(`Resend send failed: ${detailsText}`);
+    }
+    if (!(resendResult?.data?.id || resendResult?.id)) {
+      throw new Error('Resend send failed: missing message id in response');
+    }
     if (VERIFICATION_DEBUG) {
       const resendId = resendResult?.data?.id || resendResult?.id || 'n/a';
       console.log(`[verify][send:ok] provider=resend email=${recipient[0]} id=${resendId}`);
