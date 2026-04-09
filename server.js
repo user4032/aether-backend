@@ -11,7 +11,6 @@ try {
   Resend = null;
 }
 const server = http.createServer((req, res) => {
-  // Додаємо простий healthcheck для Render
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
     res.end('Aether Backend is running');
@@ -93,7 +92,6 @@ const dbToken = process.env.TURSO_AUTH_TOKEN || '';
 
 const client = createClient({ url: dbUrl, authToken: dbToken });
 
-// Спеціальна обгортка, щоб старий код працював з новою хмарною базою!
 const db = {
   run: async (sql, params, cb) => {
     if (typeof params === 'function') { cb = params; params = []; }
@@ -134,7 +132,6 @@ const activeUsers = new Map();
 const pendingVerifications = new Map();
 const pendingDeviceLinks = new Map();
 
-// Безпечна ініціалізація таблиць у хмарі
 async function initDB() {
   const tables = [
     `CREATE TABLE IF NOT EXISTS users (userName TEXT PRIMARY KEY, password TEXT, publicKey TEXT, fcmToken TEXT, avatar TEXT, bio TEXT, displayName TEXT, email TEXT, isVerified INTEGER DEFAULT 0, readReceipts INTEGER DEFAULT 1, onlineStatus INTEGER DEFAULT 1, typingIndicator INTEGER DEFAULT 1, notificationsEnabled INTEGER DEFAULT 1, messagePreview INTEGER DEFAULT 1, dmPermission TEXT DEFAULT 'everyone')`,
@@ -484,82 +481,104 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ─── FIX 1: send_verification_email — додано перевірку err + try-catch ───
   socket.on('send_verification_email', async (data, callback) => {
     const safeCallback = typeof callback === 'function' ? callback : () => {};
-    const { userName, password, publicKey } = data || {};
-    const email = (data?.email || '').toString().trim().toLowerCase();
-    if (VERIFICATION_DEBUG) {
-      console.log(`[verify][request] user=${userName || 'n/a'} email=${email || 'n/a'} hasPassword=${Boolean(password)} hasPublicKey=${Boolean(publicKey)}`);
-    }
-    if (!userName || !email || !password) return safeCallback({ success: false, message: 'Заповни всі поля' });
-
-    db.get(`SELECT userName FROM users WHERE userName = ? OR email = ?`, [userName, email], async (err, row) => {
-      if (row) return safeCallback({ success: false, message: 'Нікнейм або email вже зайнятий' });
-
-      const code = generateCode();
-      const expiresAt = Date.now() + 10 * 60 * 1000;
+    try {
+      const { userName, password, publicKey } = data || {};
+      const email = (data?.email || '').toString().trim().toLowerCase();
       if (VERIFICATION_DEBUG) {
-        console.log(`[verify][code:generated] email=${email} expiresAt=${new Date(expiresAt).toISOString()}`);
+        console.log(`[verify][request] user=${userName || 'n/a'} email=${email || 'n/a'} hasPassword=${Boolean(password)} hasPublicKey=${Boolean(publicKey)}`);
       }
-      pendingVerifications.set(email, {
-        code,
-        userData: {
-          userName,
-          email,
-          password,
-          publicKey,
-          deviceId: data.deviceId,
-          deviceName: data.deviceName,
-        },
-        expiresAt,
-      });
+      if (!userName || !email || !password) return safeCallback({ success: false, message: 'Заповни всі поля' });
 
-      try {
-        await sendVerificationEmail(email, code, userName);
-        if (VERIFICATION_DEBUG) {
-          console.log(`[verify][request:success] email=${email}`);
+      db.get(`SELECT userName FROM users WHERE userName = ? OR email = ?`, [userName, email], async (err, row) => {
+        try {
+          if (err) {
+            console.error('send_verification_email db.get error:', err?.message || err);
+            return safeCallback({ success: false, message: 'Помилка бази даних. Спробуйте ще раз.' });
+          }
+          if (row) return safeCallback({ success: false, message: 'Нікнейм або email вже зайнятий' });
+
+          const code = generateCode();
+          const expiresAt = Date.now() + 10 * 60 * 1000;
+          if (VERIFICATION_DEBUG) {
+            console.log(`[verify][code:generated] email=${email} expiresAt=${new Date(expiresAt).toISOString()}`);
+          }
+          pendingVerifications.set(email, {
+            code,
+            userData: {
+              userName,
+              email,
+              password,
+              publicKey,
+              deviceId: data.deviceId,
+              deviceName: data.deviceName,
+            },
+            expiresAt,
+          });
+
+          try {
+            await sendVerificationEmail(email, code, userName);
+            if (VERIFICATION_DEBUG) {
+              console.log(`[verify][request:success] email=${email}`);
+            }
+            safeCallback({ success: true });
+          } catch (emailErr) {
+            console.error('send_verification_email error:', emailErr?.message || emailErr);
+            if (EMAIL_ALLOW_LOG_FALLBACK) {
+              console.warn('⚠️ EMAIL_ALLOW_LOG_FALLBACK enabled. Verification code is printed to logs.');
+              console.log(`\n======================================`);
+              console.log(`🔐 VERIFICATION CODE FOR ${email}: ${code}`);
+              console.log(`======================================\n`);
+              safeCallback({ success: true, message: 'Email service unavailable. Dev log fallback used.' });
+              return;
+            }
+            pendingVerifications.delete(email);
+            safeCallback({ success: false, message: 'Не вдалося надіслати лист. Спробуйте ще раз.' });
+          }
+        } catch (innerErr) {
+          console.error('send_verification_email inner error:', innerErr?.message || innerErr);
+          safeCallback({ success: false, message: 'Внутрішня помилка сервера.' });
         }
-        safeCallback({ success: true });
-      } catch (emailErr) {
-        console.error('send_verification_email error:', emailErr?.message || emailErr);
-        if (EMAIL_ALLOW_LOG_FALLBACK) {
-          console.warn('⚠️ EMAIL_ALLOW_LOG_FALLBACK enabled. Verification code is printed to logs.');
-          console.log(`\n======================================`);
-          console.log(`🔐 VERIFICATION CODE FOR ${email}: ${code}`);
-          console.log(`======================================\n`);
-          safeCallback({ success: true, message: 'Email service unavailable. Dev log fallback used.' });
-          return;
-        }
-        pendingVerifications.delete(email);
-        safeCallback({ success: false, message: 'Не вдалося надіслати лист. Спробуйте ще раз.' });
-      }
-    });
+      });
+    } catch (outerErr) {
+      console.error('send_verification_email outer error:', outerErr?.message || outerErr);
+      safeCallback({ success: false, message: 'Внутрішня помилка сервера.' });
+    }
   });
 
+  // ─── FIX 2: verify_email_code — додано safeCallback + try-catch ──────────
   socket.on('verify_email_code', async (data, callback) => {
-    const email = (data?.email || '').toString().trim().toLowerCase();
-    const code = (data?.code || '').toString().trim();
-    const pending = pendingVerifications.get(email);
-    if (!pending) return callback({ success: false, message: 'Код не знайдено або прострочено' });
-    if (pending.expiresAt < Date.now()) {
-      pendingVerifications.delete(email);
-      return callback({ success: false, message: 'Код прострочений' });
-    }
-    if (pending.code !== code) return callback({ success: false, message: 'Невірний код' });
-    const { userName, password, publicKey, deviceId, deviceName } = pending.userData;
-    pendingVerifications.delete(email);
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const isAdminUser = userName === ADMIN_USERNAME ? 1 : 0;
-    db.run(
-      `INSERT INTO users (userName, password, publicKey, email, isVerified) VALUES (?, ?, ?, ?, ?)`,
-      [userName, hashedPassword, publicKey, email, isAdminUser],
-      (err) => {
-        if (!err && deviceId) {
-          upsertTrustedDevice({ userName, deviceId, deviceName, publicKey });
-        }
-        callback({ success: !err, message: err ? 'Помилка БД' : '' });
+    const safeCallback = typeof callback === 'function' ? callback : () => {};
+    try {
+      const email = (data?.email || '').toString().trim().toLowerCase();
+      const code = (data?.code || '').toString().trim();
+      const pending = pendingVerifications.get(email);
+      if (!pending) return safeCallback({ success: false, message: 'Код не знайдено або прострочено' });
+      if (pending.expiresAt < Date.now()) {
+        pendingVerifications.delete(email);
+        return safeCallback({ success: false, message: 'Код прострочений' });
       }
-    );
+      if (pending.code !== code) return safeCallback({ success: false, message: 'Невірний код' });
+      const { userName, password, publicKey, deviceId, deviceName } = pending.userData;
+      pendingVerifications.delete(email);
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const isAdminUser = userName === ADMIN_USERNAME ? 1 : 0;
+      db.run(
+        `INSERT INTO users (userName, password, publicKey, email, isVerified) VALUES (?, ?, ?, ?, ?)`,
+        [userName, hashedPassword, publicKey, email, isAdminUser],
+        (err) => {
+          if (!err && deviceId) {
+            upsertTrustedDevice({ userName, deviceId, deviceName, publicKey });
+          }
+          safeCallback({ success: !err, message: err ? 'Помилка БД' : '' });
+        }
+      );
+    } catch (e) {
+      console.error('verify_email_code error:', e?.message || e);
+      safeCallback({ success: false, message: 'Внутрішня помилка сервера.' });
+    }
   });
 
   socket.on('register', async (data, callback) => {
