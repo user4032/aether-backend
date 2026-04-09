@@ -176,7 +176,24 @@ async function initDB() {
   await client.execute({ sql: `UPDATE users SET isVerified = 1 WHERE userName = ?`, args: [ADMIN_USERNAME] });
   console.log('🗄️  База Aether успішно підключена до хмари Turso!');
 }
-initDB();
+async function initDBWithRetry(attempts = 5, delayMs = 3000) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await initDB();
+      return;
+    } catch (e) {
+      console.error(`⚠️  DB init attempt ${i}/${attempts} failed: ${e.message}`);
+      if (i < attempts) {
+        console.log(`🔄 Retrying in ${delayMs / 1000}s...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      } else {
+        console.error('❌ Could not connect to DB after all attempts. Server will run without DB.');
+      }
+    }
+  }
+}
+
+initDBWithRetry();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function parseReactions(raw) {
